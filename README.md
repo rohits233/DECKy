@@ -1,4 +1,4 @@
-# Decky ⚡
+# Decky 
 ### AI-powered presentation generation for consultants and strategy teams
 
 [![Demo](https://img.shields.io/badge/Watch%20Demo-Loom-purple)](YOUR_LOOM_URL)
