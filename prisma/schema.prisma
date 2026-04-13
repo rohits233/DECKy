@@ -1,0 +1,465 @@
+// =============================================================================
+// DECKY — Multi-Tenant B2B SaaS Schema
+// =============================================================================
+//
+// TENANCY MODEL: Row-Level Isolation (RLS) vs Schema-Per-Tenant
+// -------------------------------------------------------------
+// We use row-level tenant isolation (org_id FK on every table + Supabase RLS
+// policies) rather than a separate Postgres schema per tenant because:
+//
+//   1. Operational simplicity — one migration path, one connection pool,
+//      one backup/restore surface. Schema-per-tenant explodes to N×ops.
+//
+//   2. Cross-tenant analytics — billing, usage dashboards, admin tooling
+//      all run plain SQL without UNION ALL across N schemas.
+//
+//   3. Connection pooling — PgBouncer / Supabase pooler works cleanly;
+//      schema-per-tenant breaks statement-mode pooling (SET search_path).
+//
+//   4. Scale profile — consulting firms are mid-size tenants, not massive
+//      isolated enterprises. Row-level RLS + proper org_id indexes give
+//      full query isolation without the schema sprawl.
+//
+// The trade-off accepted: RLS policies must be audited carefully and every
+// query must include org_id in the WHERE clause (enforced by indexes).
+// =============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL") // bypasses pgBouncer for migrations
+}
+
+// =============================================================================
+// ENUMS
+// =============================================================================
+
+enum PlanTier {
+  FREE       // single user, 3 decks/mo
+  STARTER    // up to 10 users, 50 decks/mo
+  GROWTH     // up to 50 users, unlimited decks
+  ENTERPRISE // unlimited, custom branding, SSO
+
+}
+
+enum OrgRole {
+  OWNER   // full control, billing, delete org
+  ADMIN   // manage members, api keys, branding
+  EDITOR  // create/edit decks
+  VIEWER  // read-only deck access
+
+}
+
+enum ApiKeyTier {
+  STANDARD  // 60 req/min
+  PREMIUM   // 600 req/min
+  UNLIMITED // no rate limit (enterprise)
+
+}
+
+enum UsageEventType {
+  DECK_CREATED
+  DECK_EXPORTED        // pptx export
+  SLIDE_GENERATED      // per-slide AI call
+  DOCUMENT_PROCESSED   // ingestion + chunking
+  AI_TOKENS_CONSUMED   // raw token billing hook
+  API_REQUEST          // programmatic API call
+
+}
+
+// =============================================================================
+// ORGANIZATIONS — top-level tenant boundary
+// =============================================================================
+
+model Organization {
+  id        String   @id @default(uuid()) @db.Uuid
+  slug      String   @unique // e.g. "acme-consulting" — used in URLs + API
+  name      String
+  planTier  PlanTier @default(FREE) @map("plan_tier")
+
+  // Branding: logo URL, primary/secondary colors, font overrides
+  // Stored as JSON so we can evolve the shape without migrations
+  brandingConfig Json? @map("branding_config")
+  // shape: { logoUrl?: string, primaryColor?: string,
+  //          secondaryColor?: string, fontFamily?: string }
+
+  // Stripe customer ID — set on first checkout/subscription creation.
+  // NULL until the org upgrades from FREE. Never expose this to the client.
+  billingCustomerId String? @unique @map("billing_customer_id")
+
+  // Enterprise SSO config — NULL for orgs on FREE/STARTER.
+  // Shape (when populated): { provider: "workos"|"boxyhq", connectionId: string,
+  //   domain: string, metadataUrl?: string }
+  // Stored as JSON so adding new SAML fields never requires a migration.
+  ssoConfig Json? @map("sso_config")
+
+  // Webhook endpoint for API job completion callbacks.
+  // webhookSecret is a random 32-byte hex string; HMAC-SHA256 is computed
+  // over the payload and sent as X-Decky-Signature: sha256=<hex>.
+  // Never expose webhookSecret in API responses.
+  webhookUrl    String? @map("webhook_url")
+  webhookSecret String? @map("webhook_secret")
+
+  // ── Stripe subscription state ─────────────────────────────────────────────
+  // subscriptionId: Stripe sub_xxx — used to manage the subscription lifecycle
+  // subscriptionItemId: the specific line-item ID for usage reporting
+  // currentPeriodEnd: when the current billing period ends (from Stripe)
+  subscriptionId     String?   @unique @map("subscription_id")
+  subscriptionItemId String?   @map("subscription_item_id")
+  currentPeriodEnd   DateTime? @map("current_period_end")
+
+  // ── Grace period ──────────────────────────────────────────────────────────
+  // Set on invoice.payment_failed. While gracePeriodEndsAt > now:
+  //   • Dashboard: read-only banner, generation disabled
+  //   • API: 402 on POST /api/v1/decks
+  // Cleared on successful payment (subscription.updated with status=active).
+  gracePeriodEndsAt DateTime? @map("grace_period_ends_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt      @map("updated_at")
+
+  // Relations
+  users          OrgMembership[]
+  decks          Deck[]
+  documents      Document[]
+  apiKeys        ApiKey[]
+  usageEvents    UsageEvent[]
+  generationJobs GenerationJob[]
+  usageAlerts    UsageAlert[]
+
+  @@map("organizations")
+}
+
+// =============================================================================
+// USERS + ORG-SCOPED RBAC
+// =============================================================================
+
+// Users are global (one Supabase Auth identity) but their role is scoped
+// to each org via OrgMembership. A consultant can belong to multiple firms.
+model User {
+  id             String   @id @default(uuid()) @db.Uuid
+  // authProviderId links to supabase.auth.users.id — kept separate so we
+  // can swap auth providers without touching the data model
+  authProviderId String?  @unique @map("auth_provider_id") // NULL for email/pass-only accounts
+  email          String   @unique
+  passwordHash   String?  @map("password_hash")            // NULL for OAuth-only accounts
+  displayName    String?  @map("display_name")
+  avatarUrl      String?  @map("avatar_url")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt      @map("updated_at")
+
+  // Relations
+  memberships  OrgMembership[]
+  deckVersions DeckVersion[]   // versions authored by this user
+  apiKeys      ApiKey[]        // keys created by this user
+  usageEvents  UsageEvent[]
+
+  @@index([authProviderId]) // fast Supabase auth token → user lookup
+  @@map("users")
+}
+
+// Join table — one row per (user, org) pair. Soft-deletedAt for RBAC revoke
+// without destroying audit history. Rehiring the same person = restore row.
+model OrgMembership {
+  id        String   @id @default(uuid()) @db.Uuid
+  orgId     String   @map("org_id") @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  role      OrgRole  @default(VIEWER)
+
+  // Soft delete — set deletedAt to revoke access without losing the record.
+  // RLS policy: WHERE deleted_at IS NULL guards all app queries.
+  deletedAt DateTime? @map("deleted_at")
+
+  invitedBy String?  @map("invited_by") @db.Uuid // FK to users.id
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt      @map("updated_at")
+
+  org  Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  user User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([orgId, userId]) // one membership per (org, user) pair
+  @@index([orgId, deletedAt])  // list active members of an org
+  @@index([userId, deletedAt]) // list orgs a user belongs to
+  @@map("org_memberships")
+}
+
+// =============================================================================
+// DECKS — with immutable version snapshots + live pointer
+// =============================================================================
+
+// A Deck is the mutable "head" record. All slide content lives in DeckVersion.
+// currentVersionId is the live pointer — move it forward to "publish" a version.
+model Deck {
+  id          String  @id @default(uuid()) @db.Uuid
+  orgId       String  @map("org_id") @db.Uuid
+  ownerId     String  @map("owner_id") @db.Uuid // creating user
+
+  title       String
+  description String?
+
+  // Live pointer to the latest published snapshot.
+  // NULL while the first version is being built.
+  currentVersionId String? @unique @map("current_version_id") @db.Uuid
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt      @map("updated_at")
+
+  // Relations
+  org            Organization  @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  versions       DeckVersion[]
+  currentVersion DeckVersion?  @relation("LivePointer", fields: [currentVersionId], references: [id])
+  documents      Document[]
+  usageEvents    UsageEvent[]
+
+  @@index([orgId, createdAt(sort: Desc)]) // dashboard: org's decks newest-first
+  @@index([orgId, ownerId])               // filter: my decks within an org
+  @@map("decks")
+}
+
+// Immutable snapshot — never updated after creation.
+// Each save/publish creates a new row. The Deck.currentVersionId pointer
+// advances. Old versions stay forever for history/rollback.
+model DeckVersion {
+  id         String @id @default(uuid()) @db.Uuid
+  deckId     String @map("deck_id") @db.Uuid
+  orgId      String @map("org_id") @db.Uuid  // denormalized for RLS
+  versionNum Int    @map("version_num")       // monotonic counter per deck
+
+  // Full slide payload — layout, content, styling, speaker notes.
+  // Immutable JSON blob; never mutated after insert.
+  snapshot Json // SlideData[]
+
+  createdById String   @map("created_by_id") @db.Uuid
+  // No updatedAt — immutable by design
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  deck      Deck @relation(fields: [deckId], references: [id], onDelete: Cascade)
+  createdBy User @relation(fields: [createdById], references: [id])
+
+  // Inverse of the live pointer (only one version can be "current")
+  livePointerDeck Deck? @relation("LivePointer")
+
+  @@unique([deckId, versionNum])               // no duplicate version numbers
+  @@index([deckId, versionNum(sort: Desc)])    // version history, latest first
+  @@index([orgId, createdAt(sort: Desc)])      // org-wide audit log
+  @@map("deck_versions")
+}
+
+// =============================================================================
+// DOCUMENTS — source files used to generate decks
+// =============================================================================
+
+model Document {
+  id        String @id @default(uuid()) @db.Uuid
+  orgId     String @map("org_id") @db.Uuid   // denormalized for RLS
+  deckId    String @map("deck_id") @db.Uuid
+
+  filename  String
+  filePath  String  @map("file_path")  // Supabase Storage path
+  fileType  String  @map("file_type")  // pdf | docx | txt
+  sizeBytes Int?    @map("size_bytes")
+
+  // Extracted plain text — stored for re-processing without re-uploading
+  content String? @db.Text
+
+  status String @default("pending") // pending | processing | ready | failed
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt      @map("updated_at")
+
+  org  Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  deck Deck         @relation(fields: [deckId], references: [id], onDelete: Cascade)
+
+  @@index([deckId])        // load all docs for a deck
+  @@index([orgId, status]) // ops: find stuck processing jobs across org
+  @@map("documents")
+}
+
+// =============================================================================
+// API KEYS — hashed storage + rate limit tier
+// =============================================================================
+
+// We store only a SHA-256 hash of the key. The plaintext is shown once at
+// creation and never retrievable — same model as GitHub personal access tokens.
+// keyPrefix (first 8 chars) lets us display "sk_live_ab12cd34..." in the UI
+// and do an indexed lookup before comparing hashes.
+model ApiKey {
+  id          String     @id @default(uuid()) @db.Uuid
+  orgId       String     @map("org_id") @db.Uuid
+  createdById String     @map("created_by_id") @db.Uuid
+
+  name      String     // human label: "CI Pipeline Key", "Zapier Integration"
+  keyPrefix String     @map("key_prefix")           // first 8 chars, shown in UI
+  keyHash   String     @unique @map("key_hash")     // SHA-256(plaintext_key)
+
+  tier           ApiKeyTier @default(STANDARD) // controls rate limit
+  requestsPerMin Int        @default(60) @map("requests_per_min")
+
+  lastUsedAt DateTime? @map("last_used_at")
+  expiresAt  DateTime? @map("expires_at")  // NULL = never expires
+  revokedAt  DateTime? @map("revoked_at")  // soft revoke
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  org            Organization    @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  createdBy      User            @relation(fields: [createdById], references: [id])
+  usageEvents    UsageEvent[]
+  generationJobs GenerationJob[]
+
+  @@index([orgId, revokedAt]) // list active keys for an org
+  @@index([keyPrefix])        // fast prefix lookup before hash comparison
+  @@map("api_keys")
+}
+
+// =============================================================================
+// USAGE EVENTS — billing metering with idempotency
+// =============================================================================
+
+// Append-only event log. Each billable action writes one row.
+// idempotencyKey prevents double-billing on retries — the caller supplies
+// a stable key (e.g. "deck_export:{jobId}") and we UPSERT on conflict.
+//
+// Billing aggregation: SELECT org_id, event_type, SUM(quantity)
+//   FROM usage_events
+//   WHERE org_id = ? AND created_at BETWEEN ? AND ?
+//   GROUP BY event_type
+//
+// This table should be partitioned by created_at (range, monthly) once
+// it grows beyond ~10M rows. Prisma doesn't manage partitions — handle
+// in a raw migration.
+model UsageEvent {
+  id       String  @id @default(uuid()) @db.Uuid
+  orgId    String  @map("org_id") @db.Uuid
+  userId   String? @map("user_id") @db.Uuid   // NULL for API key calls
+  apiKeyId String? @map("api_key_id") @db.Uuid
+
+  eventType  UsageEventType @map("event_type")
+  resourceId String?        @map("resource_id") @db.Uuid // deck/doc/version id
+  deckId     String?        @map("deck_id") @db.Uuid     // for deck-scoped events
+
+  quantity Int   @default(1) // tokens consumed, slides generated, etc.
+  metadata Json? // model name, file size, slide count — for analytics
+
+  // Idempotency: caller provides a stable key; concurrent retries are safe.
+  // Pattern: "{event_type}:{resource_id}:{epoch_minute}" or a job/request ID.
+  idempotencyKey String @unique @map("idempotency_key")
+
+  // No updatedAt — usage events are immutable once written
+  createdAt DateTime @default(now()) @map("created_at")
+
+  org    Organization @relation(fields: [orgId], references: [id])
+  user   User?        @relation(fields: [userId], references: [id])
+  apiKey ApiKey?      @relation(fields: [apiKeyId], references: [id])
+  deck   Deck?        @relation(fields: [deckId], references: [id])
+
+  // Primary billing query: org usage in a date window
+  @@index([orgId, createdAt(sort: Desc)])
+  // Aggregate by event type within an org (GROUP BY friendly)
+  @@index([orgId, eventType, createdAt(sort: Desc)])
+  // Per-deck usage attribution
+  @@index([deckId, eventType])
+  // API key usage tracking / rate-limit window queries
+  @@index([apiKeyId, createdAt(sort: Desc)])
+  @@map("usage_events")
+}
+
+// =============================================================================
+// VERIFICATION TOKENS — magic link / email OTP
+// =============================================================================
+
+// =============================================================================
+// GENERATION JOBS — async deck-generation tracking for the public API
+// =============================================================================
+
+enum JobStatus {
+  PENDING    // created, not yet picked up
+  RUNNING    // pipeline in progress
+  COMPLETED  // slides ready, result populated
+  FAILED     // pipeline threw, error populated
+}
+
+// One row per API-triggered generation request.
+// The POST /api/v1/decks handler creates the row and returns the id
+// immediately (202). The background pipeline updates status as it runs.
+// GET /api/v1/decks/:id polls this row.
+model GenerationJob {
+  id       String    @id @default(uuid()) @db.Uuid
+  orgId    String    @map("org_id")    @db.Uuid
+  apiKeyId String?   @map("api_key_id") @db.Uuid // which key triggered the job
+
+  status JobStatus @default(PENDING)
+
+  // Input params stored so the job can be retried without re-parsing the request
+  input Json @map("input")
+  // Completed slide + script payload — NULL until status = COMPLETED
+  result Json? @map("result")
+  // Error message — NULL unless status = FAILED
+  error String? @map("error")
+
+  // Webhook tracking
+  webhookUrl         String?   @map("webhook_url")          // snapshot of org.webhookUrl at job creation
+  webhookDeliveredAt DateTime? @map("webhook_delivered_at") // NULL = not yet delivered
+  webhookAttempts    Int       @default(0) @map("webhook_attempts")
+  webhookLastError   String?   @map("webhook_last_error")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt      @map("updated_at")
+
+  org    Organization @relation(fields: [orgId],    references: [id])
+  apiKey ApiKey?      @relation(fields: [apiKeyId], references: [id])
+
+  @@index([orgId, createdAt(sort: Desc)]) // list org's jobs newest-first
+  @@index([apiKeyId, status])             // per-key job status dashboard
+  @@index([status, createdAt])            // ops: find stuck RUNNING jobs
+  @@map("generation_jobs")
+}
+
+// =============================================================================
+// USAGE ALERTS — idempotent 80% threshold emails
+// =============================================================================
+
+// One row per (org, alert type, billing period). The unique constraint is the
+// idempotency mechanism: INSERT ... ON CONFLICT DO NOTHING means no matter how
+// many times checkAndSendUsageAlert runs, the email fires exactly once per period.
+//
+// alertType is a free-form string today ("DECK_LIMIT_80PCT") so we can add
+// new thresholds (90%, 100%, API-requests) without a schema migration.
+//
+// period is the first day of the calendar month ("2026-03-01") — matches the
+// billing page which resets on the 1st of each month.
+model UsageAlert {
+  id        String   @id @default(uuid()) @db.Uuid
+  orgId     String   @map("org_id") @db.Uuid
+  alertType String   @map("alert_type") // e.g. "DECK_LIMIT_80PCT"
+  period    String   @map("period")     // "YYYY-MM-01" — prevents duplicate per month
+
+  sentAt    DateTime @default(now()) @map("sent_at")
+
+  org Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@unique([orgId, alertType, period]) // idempotency key
+  @@index([orgId, sentAt(sort: Desc)]) // audit log: alerts sent to this org
+  @@map("usage_alerts")
+}
+
+// =============================================================================
+// VERIFICATION TOKENS — magic link / email OTP
+// =============================================================================
+
+// Stores short-lived tokens for magic-link sign-in.
+// The minimal auth adapter (src/lib/auth-adapter.ts) creates and consumes
+// these. Tokens are deleted on use (useVerificationToken does a DELETE).
+// Expired tokens should be swept by a cron job:
+//   DELETE FROM verification_tokens WHERE expires < NOW();
+model VerificationToken {
+  identifier String   // email address the token was sent to
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token]) // compound unique required by NextAuth adapter interface
+  @@map("verification_tokens")
+}
